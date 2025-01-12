@@ -1,0 +1,1 @@
+# trend_seasonal_multimodal
