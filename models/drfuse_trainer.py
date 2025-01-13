@@ -10,15 +10,33 @@ import lightning.pytorch as pl
 from .drfuse import DrFuseModel
 
 
+# class JSD(nn.Module):
+#     def __init__(self):
+#         super(JSD, self).__init__()
+#         self.kl = nn.KLDivLoss(reduction='none', log_target=True)
+
+#     def forward(self, p: torch.tensor, q: torch.tensor, masks):
+#         p, q = p.view(-1, p.size(-1)), q.view(-1, q.size(-1))
+#         m = (0.5 * (p + q)).log()
+#         return 0.5 * (self.kl(m, p.log()) + self.kl(m, q.log())).sum() / max(1e-6, masks.sum())
 class JSD(nn.Module):
     def __init__(self):
         super(JSD, self).__init__()
         self.kl = nn.KLDivLoss(reduction='none', log_target=True)
 
-    def forward(self, p: torch.tensor, q: torch.tensor, masks):
-        p, q = p.view(-1, p.size(-1)), q.view(-1, q.size(-1))
-        m = (0.5 * (p + q)).log()
-        return 0.5 * (self.kl(m, p.log()) + self.kl(m, q.log())).sum() / max(1e-6, masks.sum())
+    def forward(self, p: torch.Tensor, q: torch.Tensor, r: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+        p, q, r = p.view(-1, p.size(-1)), q.view(-1, q.size(-1)), r.view(-1, r.size(-1))
+        
+        m_pq = (0.5 * (p + q)).log()
+        m_pr = (0.5 * (p + r)).log()
+        m_qr = (0.5 * (q + r)).log()
+
+        jsd_pq = 0.5 * (self.kl(m_pq, p.log()) + self.kl(m_pq, q.log()))
+        jsd_pr = 0.5 * (self.kl(m_pr, p.log()) + self.kl(m_pr, r.log()))
+        jsd_qr = 0.5 * (self.kl(m_qr, q.log()) + self.kl(m_qr, r.log()))
+
+        jsd_total = (jsd_pq + jsd_pr + jsd_qr) / 3.0
+        return jsd_total.sum() / max(1e-6, masks.sum())
 
 
 class DrFuseTrainer(pl.LightningModule):
@@ -31,7 +49,7 @@ class DrFuseTrainer(pl.LightningModule):
                                  ehr_n_layers=args.ehr_n_layers)
 
         self.save_hyperparameters(args)  # args goes to self.hparams
-
+        print('parameters',self.hparams)
         self.pred_criterion = nn.BCELoss(reduction='none')
         self.alignment_cos_sim = nn.CosineSimilarity(dim=1)
         self.triplet_loss = nn.TripletMarginLoss(reduction='none')
@@ -39,15 +57,15 @@ class DrFuseTrainer(pl.LightningModule):
         self.jsd = JSD()
 
         # self.val_preds = []
-        self.val_preds = {k: [] for k in ['final', 'ehr', 'cxr']}
+        self.val_preds = {k: [] for k in ['final', 'trend','sea', 'cxr']}
         self.val_labels = []
         self.val_pairs = []
 
         self.test_preds = []
         self.test_labels = []
         self.test_pairs = []
-        self.test_feats = {k: [] for k in ['feat_ehr_shared', 'feat_ehr_distinct',
-                                           'feat_cxr_shared', 'feat_cxr_distinct']}
+        self.test_feats = {k: [] for k in ['feat_trend_shared','feat_sea_shared','feat_cxr_shared','feat_trend_distinct',    'feat_sea_distinct','feat_cxr_distinct']}#'feat_ehr_shared', 'feat_ehr_distinct',
+                                           #'feat_cxr_shared', 'feat_cxr_distinct']}
         self.test_attns = []
 
         self.label_names = label_names
@@ -68,18 +86,23 @@ class DrFuseTrainer(pl.LightningModule):
         ehr_mask = torch.ones_like(pairs)
         loss_sim_cxr = self._masked_abs_cos_sim(model_output['feat_cxr_shared'],
                                                 model_output['feat_cxr_distinct'], pairs)
-        loss_sim_ehr = self._masked_abs_cos_sim(model_output['feat_ehr_shared'],
-                                                model_output['feat_ehr_distinct'], ehr_mask)
+        loss_sim_trend = self._masked_abs_cos_sim(model_output['feat_trend_shared'],
+                                                model_output['feat_trend_distinct'], ehr_mask)
+        
+        loss_sim_sea = self._masked_abs_cos_sim(model_output['feat_sea_shared'],
+                                                model_output['feat_sea_distinct'], ehr_mask)
 
-        jsd = self.jsd(model_output['feat_ehr_shared'].sigmoid(),
+        jsd = self.jsd(model_output['feat_trend_shared'].sigmoid(),model_output['feat_sea_shared'].sigmoid(),
                        model_output['feat_cxr_shared'].sigmoid(), pairs)
 
         loss_disentanglement = (self.hparams.lambda_disentangle_shared * jsd +
-                                self.hparams.lambda_disentangle_ehr * loss_sim_ehr +
+                                self.hparams.lambda_disentangle_trend * loss_sim_trend +
+                                self.hparams.lambda_disentangle_sea * loss_sim_sea +
                                 self.hparams.lambda_disentangle_cxr * loss_sim_cxr)
         if log:
             self.log_dict({
-                f'disentangle_{mode}/EHR_disinct': loss_sim_ehr.detach(),
+                f'disentangle_{mode}/trend_disinct': loss_sim_trend.detach(),
+                f'disentangle_{mode}/sea_disinct': loss_sim_sea.detach(),
                 f'disentangle_{mode}/CXR_disinct': loss_sim_cxr.detach(),
                 f'disentangle_{mode}/shared_jsd': jsd.detach(),
                 'step': float(self.current_epoch)
@@ -90,7 +113,8 @@ class DrFuseTrainer(pl.LightningModule):
     def _compute_prediction_losses(self, model_output, y_gt, pairs, log=True, mode='train'):
         ehr_mask = torch.ones_like(model_output['pred_final'][:, 0])
         loss_pred_final = self._compute_masked_pred_loss(model_output['pred_final'], y_gt, ehr_mask)
-        loss_pred_ehr = self._compute_masked_pred_loss(model_output['pred_ehr'], y_gt, ehr_mask)
+        loss_pred_trend = self._compute_masked_pred_loss(model_output['pred_trend'], y_gt, ehr_mask)
+        loss_pred_sea = self._compute_masked_pred_loss(model_output['pred_sea'], y_gt, ehr_mask)
         loss_pred_cxr = self._compute_masked_pred_loss(model_output['pred_cxr'], y_gt, pairs)
         loss_pred_shared = self._compute_masked_pred_loss(model_output['pred_shared'], y_gt, ehr_mask)
 
@@ -98,19 +122,21 @@ class DrFuseTrainer(pl.LightningModule):
             self.log_dict({
                 f'{mode}_loss/pred_final': loss_pred_final.detach(),
                 f'{mode}_loss/pred_shared': loss_pred_shared.detach(),
-                f'{mode}_loss/pred_ehr': loss_pred_ehr.detach(),
+                f'{mode}_loss/pred_trend': loss_pred_trend.detach(),
+                f'{mode}_loss/pred_sea': loss_pred_sea.detach(),
                 f'{mode}_loss/pred_cxr': loss_pred_cxr.detach(),
                 'step': float(self.current_epoch)
             }, on_epoch=True, on_step=False, batch_size=y_gt.shape[0])
 
-        return loss_pred_final, loss_pred_ehr, loss_pred_cxr, loss_pred_shared
+        return loss_pred_final, loss_pred_trend,loss_pred_sea, loss_pred_cxr, loss_pred_shared
 
     def _compute_and_log_loss(self, model_output, y_gt, pairs, log=True, mode='train'):
         prediction_losses = self._compute_prediction_losses(model_output, y_gt, pairs, log, mode)
-        loss_pred_final, loss_pred_ehr, loss_pred_cxr, loss_pred_shared = prediction_losses
+        loss_pred_final, loss_pred_trend,loss_pred_sea, loss_pred_cxr, loss_pred_shared = prediction_losses
 
         loss_prediction = (self.hparams.lambda_pred_shared * loss_pred_shared +
-                           self.hparams.lambda_pred_ehr * loss_pred_ehr +
+                           self.hparams.lambda_pred_ehr * loss_pred_trend +
+                           self.hparams.lambda_pred_ehr * loss_pred_sea +
                            self.hparams.lambda_pred_cxr * loss_pred_cxr)
 
         loss_prediction = loss_pred_final + loss_prediction
@@ -121,27 +147,41 @@ class DrFuseTrainer(pl.LightningModule):
         epoch_log = {}
 
         # aux loss for attention ranking
-        raw_pred_loss_ehr = F.binary_cross_entropy(model_output['pred_ehr'].data, y_gt, reduction='none')
+        raw_pred_loss_trend = F.binary_cross_entropy(model_output['pred_trend'].data, y_gt, reduction='none')
+        raw_pred_loss_sea = F.binary_cross_entropy(model_output['pred_sea'].data, y_gt, reduction='none')
         raw_pred_loss_cxr = F.binary_cross_entropy(model_output['pred_cxr'].data, y_gt, reduction='none')
         raw_pred_loss_shared = F.binary_cross_entropy(model_output['pred_shared'].data, y_gt, reduction='none')
 
         pairs = pairs.unsqueeze(1)
         attn_weights = model_output['attn_weights']
-        attn_ehr, attn_shared, attn_cxr = attn_weights[:, :, 0], attn_weights[:, :, 1], attn_weights[:, :, 2]
+#         print(attn_weights.shape)
+        attn_trend,attn_sea, attn_shared, attn_cxr = attn_weights[:, :, 0],attn_weights[:, :, 1], attn_weights[:, :, 2], attn_weights[:, :, 3]
 
-        cxr_overweights_ehr = 2 * (raw_pred_loss_cxr < raw_pred_loss_ehr).float() - 1
-        loss_attn1 = pairs * F.margin_ranking_loss(attn_cxr, attn_ehr, cxr_overweights_ehr, reduction='none')
+        cxr_overweights_trend = 2 * (raw_pred_loss_cxr < raw_pred_loss_trend).float() - 1
+        loss_attn1 = pairs * F.margin_ranking_loss(attn_cxr, attn_trend, cxr_overweights_trend, reduction='none')
         loss_attn1 = loss_attn1.sum() / max(1e-6, loss_attn1[loss_attn1>0].numel())
-
-        shared_overweights_ehr = 2 * (raw_pred_loss_shared < raw_pred_loss_ehr).float() - 1
-        loss_attn2 = pairs * F.margin_ranking_loss(attn_shared, attn_ehr, shared_overweights_ehr, reduction='none')
+        
+        cxr_overweights_sea = 2 * (raw_pred_loss_cxr < raw_pred_loss_sea).float() - 1
+        loss_attn2 = pairs * F.margin_ranking_loss(attn_cxr, attn_sea, cxr_overweights_sea, reduction='none')
         loss_attn2 = loss_attn2.sum() / max(1e-6, loss_attn2[loss_attn2>0].numel())
-
-        shared_overweights_cxr = 2 * (raw_pred_loss_shared < raw_pred_loss_cxr).float() - 1
-        loss_attn3 = pairs * F.margin_ranking_loss(attn_shared, attn_cxr, shared_overweights_cxr, reduction='none')
+        
+        trend_overweights_sea = 2 * (raw_pred_loss_trend < raw_pred_loss_sea).float() - 1
+        loss_attn3 = pairs * F.margin_ranking_loss(attn_trend, attn_sea, trend_overweights_sea, reduction='none')
         loss_attn3 = loss_attn3.sum() / max(1e-6, loss_attn3[loss_attn3>0].numel())
 
-        loss_attn_ranking = (loss_attn1 + loss_attn2 + loss_attn3) / 3
+        shared_overweights_trend = 2 * (raw_pred_loss_shared < raw_pred_loss_trend).float() - 1
+        loss_attn4 = pairs * F.margin_ranking_loss(attn_shared, attn_trend, shared_overweights_trend, reduction='none')
+        loss_attn4 = loss_attn4.sum() / max(1e-6, loss_attn4[loss_attn4>0].numel())
+        
+        shared_overweights_sea = 2 * (raw_pred_loss_shared < raw_pred_loss_sea).float() - 1
+        loss_attn5 = pairs * F.margin_ranking_loss(attn_shared, attn_sea, shared_overweights_sea, reduction='none')
+        loss_attn5 = loss_attn5.sum() / max(1e-6, loss_attn5[loss_attn5>0].numel())
+
+        shared_overweights_cxr = 2 * (raw_pred_loss_shared < raw_pred_loss_cxr).float() - 1
+        loss_attn6 = pairs * F.margin_ranking_loss(attn_shared, attn_cxr, shared_overweights_cxr, reduction='none')
+        loss_attn6 = loss_attn6.sum() / max(1e-6, loss_attn6[loss_attn6>0].numel())
+
+        loss_attn_ranking = (loss_attn1 + loss_attn2 + loss_attn3+loss_attn4+loss_attn5+loss_attn6) / 6
 
         loss_total = loss_total + self.hparams.lambda_attn_aux * loss_attn_ranking
         epoch_log[f'{mode}_loss/attn_aux'] = loss_attn_ranking.detach()
@@ -164,25 +204,38 @@ class DrFuseTrainer(pl.LightningModule):
         pairs = torch.FloatTensor(pairs).to(self.device)
         return x, img, y, seq_lengths, pairs
 
+    def _get_alignment_lambda(self):
+        if self.hparams.adaptive_adc_lambda:
+            lmbda = 2 / (1 + math.exp(-self.hparams.gamma * self.current_epoch)) - 1
+        else:
+            lmbda = 1
+        return lmbda
+
     def training_step(self, batch, batch_idx):
         x, img, y, seq_lengths, pairs = self._get_batch_data(batch)
         if self.hparams.data_pair == 'paired' and self.hparams.aug_missing_ratio > 0:
             perm = torch.randperm(pairs.shape[0])
             idx = perm[:int(self.hparams.aug_missing_ratio * pairs.shape[0])]
             pairs[idx] = 0
-        out = self.model(x, img, seq_lengths, pairs, 0)
+        
+        out = self.model(x, img, seq_lengths, pairs, self._get_alignment_lambda())
         return self._compute_and_log_loss(out, y_gt=y, pairs=pairs)
 
     def validation_step(self, batch, batch_idx):
         x, img, y, seq_lengths, pairs = self._get_batch_data(batch)
-        out = self.model(x, img, seq_lengths, pairs, 0)
+        out = self.model(x, img, seq_lengths, pairs, self._get_alignment_lambda())
         loss = self._compute_and_log_loss(out, y_gt=y, pairs=pairs, mode='val')
-
-        pred_final =  out['pred_final']
+        if self.hparams.attn_fusion == 'avg':
+            perd_final = (out['pred_trend']+out['pred_sea'] + out['pred_cxr'] + out['pred_shared']) / 4
+            pred_final = ((1 - pairs.unsqueeze(1)) * (out['pred_trend'] + out['pred_shared']+out['pred_sea']) / 3 +
+                      pairs.unsqueeze(1) * perd_final)
+        else:
+            pred_final =  out['pred_final']
 
         # self.val_preds.append(out['pred_final'])
         self.val_preds['final'].append(pred_final)
-        self.val_preds['ehr'].append(out['pred_ehr'])
+        self.val_preds['trend'].append(out['pred_trend'])
+        self.val_preds['sea'].append(out['pred_sea'])
         self.val_preds['cxr'].append(out['pred_cxr'])
         self.val_pairs.append(pairs)
         self.val_labels.append(y)
@@ -191,7 +244,7 @@ class DrFuseTrainer(pl.LightningModule):
         return self._compute_masked_pred_loss(pred_final, y, torch.ones_like(y[:, 0]))
 
     def on_validation_epoch_end(self):
-        for name in ['final', 'ehr', 'cxr']:
+        for name in ['final', 'trend','sea', 'cxr']:
             y_gt = torch.concat(self.val_labels, dim=0)
             preds = torch.concat(self.val_preds[name], dim=0)
             if name == 'cxr':
@@ -216,7 +269,7 @@ class DrFuseTrainer(pl.LightningModule):
                 log_dict[f'val_AUROC_per_dx_{name}/{self.label_names[i]}'] = mlroc[i]
 
             self.log_dict(log_dict)
-
+        print(f'Val==prauc{mlaps.mean()},auroc{mlroc.mean()}')
         for k in self.val_preds:
             self.val_preds[k].clear()
         self.val_pairs.clear()
@@ -224,9 +277,13 @@ class DrFuseTrainer(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         x, img, y, seq_lengths, pairs = self._get_batch_data(batch)
-        out = self.model(x, img, seq_lengths, pairs, 0)
-
-        pred_final =  out['pred_final']
+        out = self.model(x, img, seq_lengths, pairs, self._get_alignment_lambda())
+        if self.hparams.attn_fusion == 'avg':
+            perd_final = (out['pred_trend'] +out['pred_sea'] + out['pred_cxr'] + out['pred_shared']) / 4
+            pred_final = ((1 - pairs.unsqueeze(1)) * (out['pred_trend'] + out['pred_shared']+out['pred_sea']) / 3 +
+                          pairs.unsqueeze(1) * perd_final)
+        else:
+            pred_final =  out['pred_final']
 
         self.test_preds.append(pred_final)
         self.test_labels.append(y)
@@ -254,6 +311,7 @@ class DrFuseTrainer(pl.LightningModule):
             'auroc': mlroc.mean().item(),
             'attn_weight': attn_weights.cpu()
         }
+        print(f'Test==prauc{mlaps.mean},auroc{mlroc.mean()}')
         for k in self.test_feats:
             self.test_results[k] = torch.concat(self.test_feats[k], dim=0)
             self.test_feats[k].clear()
