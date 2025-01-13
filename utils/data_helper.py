@@ -163,15 +163,15 @@ def get_ehr_datasets(discretizer, normalizer, ehr_data_dir,
                      list_file_name='ehr_list_phenotyping_48h'):
     train_ds = EHRdataset(discretizer, normalizer,
                           listfile=ehr_data_dir/(list_file_name+'_train.csv'),
-                          dataset_dir=ehr_data_dir/'train',
+                          dataset_dir=ehr_data_dir/'phenotyping/train',
                           ehr_pkl_fpath=ehr_pkl_fpath_train)
     val_ds = EHRdataset(discretizer, normalizer,
                         listfile=ehr_data_dir/(list_file_name+'_val.csv'),
-                        dataset_dir=ehr_data_dir/'train',
+                        dataset_dir=ehr_data_dir/'phenotyping/train',
                         ehr_pkl_fpath=ehr_pkl_fpath_val)
     test_ds = EHRdataset(discretizer, normalizer,
                          listfile=ehr_data_dir/(list_file_name+'_test.csv'),
-                         dataset_dir=ehr_data_dir/'test',
+                         dataset_dir=ehr_data_dir/'phenotyping/test',
                          ehr_pkl_fpath=ehr_pkl_fpath_test)
     return train_ds, val_ds, test_ds
 
@@ -188,7 +188,7 @@ def load_discretized_header(discretizer, ehr_dir, txt_fpath=None):
             with open(txt_fpath, 'r') as f:
                 header = [x.strip() for x in f.readlines()]
     else:
-        path = ehr_dir / 'phenotyping_raw_ts/train/14991576_episode3_timeseries.csv'
+        path = ehr_dir /'phenotyping/train/14991576_episode3_timeseries.csv'
         ret = []
         with open(path, "r") as tsfile:
             header = tsfile.readline().strip().split(',')
